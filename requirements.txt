@@ -1,0 +1,11 @@
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.9.2
+seaborn==0.13.2
+scikit-learn==1.5.1
+yfinance>=0.2.66
+gymnasium==0.29.1
+notebook==7.2.2
+ipykernel==6.29.5
+nbformat==5.10.4
+tqdm==4.66.5
