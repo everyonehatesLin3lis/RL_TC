@@ -6,6 +6,7 @@ __pycache__/
 data/raw/*.csv
 data/processed/*.csv
 reports/figures/*.png
+!reports/figures/readme_*.png
 models/*.pkl
 models/*.joblib
 
