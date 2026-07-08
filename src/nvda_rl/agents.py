@@ -44,7 +44,9 @@ class QLearningAgent:
         """
         if explore and self.rng.random() < self.epsilon:
             return int(self.rng.choice(ACTIONS))
-        return int(ACTIONS[np.argmax(self.q_table[state])])
+        values = self.q_table[state]
+        tied_best = np.flatnonzero(values == values.max())
+        return int(ACTIONS[self.rng.choice(tied_best)])
 
     def train(self, env: TradingEnvironment, episodes: int = 300) -> list[float]:
         """

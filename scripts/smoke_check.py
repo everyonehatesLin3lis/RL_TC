@@ -6,7 +6,7 @@ import pandas as pd
 from nvda_rl.agents import QLearningAgent
 from nvda_rl.env import TradingEnvironment
 from nvda_rl.evaluation import performance_metrics, strategy_frame
-from nvda_rl.features import add_market_features, discretize_state_features, fit_unsupervised_features
+from nvda_rl.features import add_market_features, discretize_train_test, fit_unsupervised_train_test
 from nvda_rl.ppo import PPO_OBSERVATION_COLUMNS, scale_train_test, timed_ppo_comparison
 
 
@@ -34,9 +34,10 @@ def main() -> None:
     )
 
     featured = add_market_features(raw)
-    enriched, _, _ = fit_unsupervised_features(featured)
-    states = discretize_state_features(enriched)
-    state_columns = ["regime", "return_bin", "vol_bin", "momentum_bin", "rsi_bin", "macd_bin", "pca_1_bin"]
+    train_enriched, test_enriched, _, _ = fit_unsupervised_train_test(featured, split_date="2020-06-01")
+    train_states, test_states, _ = discretize_train_test(train_enriched, test_enriched)
+    states = pd.concat([train_states, test_states], ignore_index=True)
+    state_columns = ["regime", "momentum_bin", "vol_bin"]
 
     env = TradingEnvironment(states, state_columns=state_columns)
     agent = QLearningAgent(epsilon=0.2, epsilon_decay=0.98)

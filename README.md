@@ -23,6 +23,7 @@ The RL notebook trains models, saves them in `models/`, reloads them, and only t
 Saved artifacts include:
 
 - `models/q_learning.pkl`
+- `models/q_regime_only.pkl`
 - `models/q_no_unsup.pkl`
 - `models/ppo_scaler.pkl`
 - `models/ppo_60s.pkl`
@@ -105,7 +106,11 @@ The file also creates unsupervised regimes:
 - `StandardScaler` is used before clustering because features have different units. For example, RSI is around 0-100, while returns are usually small decimals.
 - `PCA` compresses the feature set into two components. This helps summarize the broad market state and gives the RL agent extra state information.
 
-Why 3 regimes: it keeps the interpretation simple. In the notebook results, the regimes can be read as a stress/negative regime, a normal positive regime, and a strong momentum regime. More clusters might fit the history more closely, but they would be harder to explain and easier to overfit.
+To reduce data leakage, `fit_unsupervised_train_test()` splits chronologically first. The scaler, K-means, and PCA models are fitted only before `2021-01-01`; the test period is assigned regimes with `.predict()` and PCA `.transform()`.
+
+Current-day return is not used as a clustering feature. Regimes are interpreted with `next_day_return`, volatility, momentum, RSI, ATR, and drawdown. This makes the regime analysis less mechanical because clusters are not directly built from the same return that is later used to describe them.
+
+Why 3 regimes: it keeps the interpretation simple. The current regimes are best read as different market states by momentum, volatility, drawdown, and RSI rather than as guaranteed positive/negative return labels. More clusters might fit history more closely, but they would be harder to explain and easier to overfit.
 
 ### `env.py`
 
@@ -121,7 +126,7 @@ The reward formula is:
 r_net_t = a_(t-1) * return_t - cost * |a_t - a_(t-1)|
 ```
 
-This means the agent earns today's return from yesterday's position, then pays a transaction cost if it changes position today. This prevents the model from looking unrealistically good by trading constantly for free.
+This means the agent observes end-of-day features, chooses the next position, earns the next daily return from its previous position, then pays a transaction cost if it changes position. This prevents the model from looking unrealistically good by trading constantly for free.
 
 There are two environment classes:
 
@@ -143,7 +148,15 @@ Important settings:
 - `epsilon`: exploration rate. During training, the agent sometimes tries random actions so it can discover better choices.
 - `epsilon_decay`: slowly reduces random exploration as training continues.
 
-Why feature binning is needed: tabular Q-learning cannot directly handle continuous values like RSI `63.42` or volatility `0.027`. The project uses quantile bins so each feature becomes a small integer category.
+Why feature binning is needed: tabular Q-learning cannot directly handle continuous values like RSI `63.42` or volatility `0.027`. The project learns quantile bin boundaries from the training period only, then applies the same fixed boundaries to the test period.
+
+The Q-learning state was intentionally reduced to avoid a very sparse Q-table. The main comparison uses:
+
+- baseline: `momentum_bin + vol_bin + previous_action`
+- regime only: `regime + momentum_bin + vol_bin + previous_action`
+- regime and PCA: `regime + momentum_bin + vol_bin + pca_1_bin + previous_action`
+
+`previous_action` is included because transaction costs depend on whether the agent changes position. Tie handling is also randomized, so unseen states no longer automatically choose short just because `-1` is the first action.
 
 Result meaning: if Q-learning performs poorly, it does not automatically mean regimes are useless. It may mean the discretized state table is too simple, the action space is too limited, transaction costs are too high for the learned behavior, or the bullish test period strongly favors buy-and-hold.
 
@@ -155,7 +168,7 @@ PPO stands for Proximal Policy Optimization. The main idea is to improve a polic
 
 Important parts:
 
-- `PPO_OBSERVATION_COLUMNS`: the continuous features used by the policy, including returns, risk, momentum, regime, and PCA components.
+- `PPO_OBSERVATION_COLUMNS`: the continuous features used by the policy, including risk, momentum, regime, and PCA components. Current-day return is not passed as an observation feature.
 - `scale_train_test()`: scales features using only the training period. This avoids leaking test-period information into training.
 - `LinearPPOAgent`: learns action probabilities from market features.
 - `train_ppo_for_seconds()`: trains for fixed time budgets like 60, 300, or 600 seconds.
@@ -175,13 +188,15 @@ Main outputs:
 - `buy_and_hold_frame()`: creates the passive benchmark. This is important because NVDA had very strong long-term upside.
 - `random_policy_actions()`: creates a random baseline. A trained model should beat random trading to be meaningful.
 - `max_drawdown()`: worst loss from a previous equity peak.
-- `performance_metrics()`: returns cumulative return, average daily return, annualized return, annualized volatility, max drawdown, hit ratio, and turnover.
+- `performance_metrics()`: returns cumulative return, average daily return, annualized return, annualized volatility, Sharpe ratio, Sortino ratio, max drawdown, hit ratio, and turnover.
 
 Metric meanings:
 
 - `cumulative_return`: total growth over the test period.
-- `annualized_return`: average daily return converted to a yearly scale.
+- `annualized_return`: CAGR estimated from the equity curve and elapsed trading years.
 - `annualized_volatility`: yearly-scaled return variation, used as a risk measure.
+- `sharpe_ratio`: return per unit of volatility.
+- `sortino_ratio`: return per unit of downside volatility.
 - `max_drawdown`: the largest peak-to-trough fall. Lower drawdown is usually better.
 - `hit_ratio`: share of days with positive net return.
 - `turnover`: how much the strategy changes position. Higher turnover usually means more trading cost.
@@ -202,7 +217,7 @@ The strongest direct relationship with daily return is 5-day momentum. ATR/range
 
 ![Regime chart](reports/figures/readme_regimes.png)
 
-The k-means regimes are economically interpretable: one stress regime with negative average return, one normal positive regime, and one strong momentum regime.
+The k-means regimes are economically interpretable as different combinations of momentum, volatility, drawdown, and RSI. Because current-day return is excluded from clustering, the regimes should be treated as market-state features rather than guaranteed return labels.
 
 ## RL Graphic
 
@@ -210,7 +225,7 @@ The k-means regimes are economically interpretable: one stress regime with negat
 
 Buy-and-hold is a difficult benchmark for NVDA because the test period is strongly bullish. The RL strategies are still useful for learning because they show how transaction costs, overtrading, and regime features affect policy behavior.
 
-In the executed notebook, all test results come from saved-and-reloaded models. Buy-and-hold gained about `1,424%` out of sample. The best PPO-style timed run was the 5-minute saved model, but it still lost about `77%`, so longer training did not solve the policy problem.
+In the executed notebook, all test results come from saved-and-reloaded models. Buy-and-hold remains a difficult benchmark because the test period is strongly bullish. The important RL comparison is the ablation table: technical-feature Q-learning versus Q-learning with regimes versus Q-learning with regimes plus PCA.
 
 ## Reward Definition
 
@@ -218,11 +233,12 @@ In the executed notebook, all test results come from saved-and-reloaded models. 
 r_net_t = a_(t-1) * return_t - cost * |a_t - a_(t-1)|
 ```
 
-The agent earns return from yesterday's position and pays a cost when changing today's position.
+The agent observes features at the end of day `t`, chooses the position for the next step, earns return from the previous position, and pays a cost when changing position. The Q-learning state includes previous position so the cost is not hidden from the agent.
 
 ## Review Talking Points
 
-- Regimes only help if they describe meaningful market states.
-- Q-learning is interpretable but needs feature binning.
-- PPO uses continuous features and lets us compare whether longer training time helps.
-- This is a learning project, not a production trading strategy. A real strategy would need walk-forward testing, slippage, and stricter overfitting controls.
+- The central question is whether unsupervised regime and PCA features improve out-of-sample RL behavior compared with technical features alone.
+- Regime/PCA models are fitted on train only, then applied to test to avoid leakage.
+- Q-learning is interpretable but needs feature binning and a small enough state space.
+- PPO here is a PPO-style clipped policy-gradient model, not a full canonical PPO implementation with critic, GAE, and minibatch optimization.
+- This is a learning project, not a production trading strategy. A real strategy would need walk-forward testing, slippage, short-borrow assumptions, transaction-cost sensitivity, and multi-seed robustness checks.

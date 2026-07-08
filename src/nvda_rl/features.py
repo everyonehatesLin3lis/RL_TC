@@ -23,6 +23,16 @@ FEATURE_COLUMNS = [
     "atr_14_pct",
 ]
 
+CLUSTER_FEATURE_COLUMNS = [column for column in FEATURE_COLUMNS if column != "return"]
+
+STATE_BIN_COLUMNS = {
+    "vol_bin": "volatility_20d",
+    "momentum_bin": "momentum_20d",
+    "rsi_bin": "rsi_14",
+    "macd_bin": "macd_hist",
+    "pca_1_bin": "pca_1",
+}
+
 
 def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
     """
@@ -91,6 +101,7 @@ def add_market_features(prices: pd.DataFrame) -> pd.DataFrame:
     """
     data = prices.copy().sort_values("date").reset_index(drop=True)
     data["return"] = data["adj_close"].pct_change()
+    data["next_day_return"] = data["return"].shift(-1)
     data["log_return"] = np.log(data["adj_close"]).diff()
     data["volatility_20d"] = data["return"].rolling(20).std()
     data["momentum_5d"] = data["adj_close"].pct_change(5)
@@ -125,10 +136,12 @@ def fit_unsupervised_features(
 
     K-means groups similar days into discrete regimes. PCA compresses the same
     feature matrix into two numeric components that summarize broad market
-    structure for later RL state features.
+    structure for later RL state features. By default, current-day return is
+    excluded from clustering to avoid creating mechanically return-sorted
+    regimes.
     """
     if feature_columns is None:
-        feature_columns = FEATURE_COLUMNS
+        feature_columns = CLUSTER_FEATURE_COLUMNS
 
     X = data[feature_columns]
     regime_model = Pipeline(
@@ -154,6 +167,60 @@ def fit_unsupervised_features(
     return enriched, regime_model, pca_model
 
 
+def transform_unsupervised_features(
+    data: pd.DataFrame,
+    regime_model: Pipeline,
+    pca_model: Pipeline,
+    feature_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Apply fitted regime and PCA models to new chronological data.
+
+    This is used for the test period so cluster centers and PCA components come
+    only from the training period.
+    """
+    if feature_columns is None:
+        feature_columns = CLUSTER_FEATURE_COLUMNS
+
+    X = data[feature_columns]
+    enriched = data.copy()
+    enriched["regime"] = regime_model.predict(X)
+    components = pca_model.transform(X)
+    enriched["pca_1"] = components[:, 0]
+    enriched["pca_2"] = components[:, 1]
+    return enriched
+
+
+def fit_unsupervised_train_test(
+    data: pd.DataFrame,
+    split_date: str = "2021-01-01",
+    feature_columns: list[str] | None = None,
+    n_clusters: int = 3,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, Pipeline, Pipeline]:
+    """
+    Chronologically split data, fit unsupervised models on train, transform test.
+
+    This avoids test-period leakage in StandardScaler, K-means, and PCA.
+    """
+    data = data.sort_values("date").reset_index(drop=True)
+    train = data[data["date"] < split_date].reset_index(drop=True)
+    test = data[data["date"] >= split_date].reset_index(drop=True)
+    train_enriched, regime_model, pca_model = fit_unsupervised_features(
+        train,
+        feature_columns=feature_columns,
+        n_clusters=n_clusters,
+        random_state=random_state,
+    )
+    test_enriched = transform_unsupervised_features(
+        test,
+        regime_model=regime_model,
+        pca_model=pca_model,
+        feature_columns=feature_columns,
+    )
+    return train_enriched, test_enriched, regime_model, pca_model
+
+
 def describe_regimes(data: pd.DataFrame) -> pd.DataFrame:
     """
     Summarize the economic behavior of each discovered regime.
@@ -166,16 +233,57 @@ def describe_regimes(data: pd.DataFrame) -> pd.DataFrame:
         data.groupby("regime")
         .agg(
             days=("date", "count"),
-            avg_return=("return", "mean"),
+            avg_next_day_return=("next_day_return", "mean"),
             avg_volatility=("volatility_20d", "mean"),
             avg_momentum_20d=("momentum_20d", "mean"),
             avg_drawdown=("drawdown", "mean"),
             avg_rsi=("rsi_14", "mean"),
             avg_atr_pct=("atr_14_pct", "mean"),
         )
-        .sort_values("avg_return")
+        .sort_values("avg_next_day_return")
     )
     return summary
+
+
+def fit_state_bins(train: pd.DataFrame, q: int = 5) -> dict[str, np.ndarray]:
+    """
+    Learn fixed state-bin boundaries from training data only.
+
+    The returned edges can be applied to validation or test data with
+    `apply_state_bins`, avoiding quantile leakage from future periods.
+    """
+    bin_edges = {}
+    for output_column, source_column in STATE_BIN_COLUMNS.items():
+        _, edges = pd.qcut(train[source_column], q=q, retbins=True, duplicates="drop")
+        edges = edges.astype(float)
+        edges[0] = -np.inf
+        edges[-1] = np.inf
+        bin_edges[output_column] = np.unique(edges)
+    return bin_edges
+
+
+def apply_state_bins(data: pd.DataFrame, bin_edges: dict[str, np.ndarray]) -> pd.DataFrame:
+    """
+    Apply fixed training-period bin boundaries to a dataset.
+    """
+    states = data.copy()
+    for output_column, edges in bin_edges.items():
+        source_column = STATE_BIN_COLUMNS[output_column]
+        states[output_column] = pd.cut(states[source_column], bins=edges, labels=False, include_lowest=True)
+    states[list(bin_edges)] = states[list(bin_edges)].astype(int)
+    return states
+
+
+def discretize_train_test(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    q: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, np.ndarray]]:
+    """
+    Fit Q-learning bins on training data and apply them to train and test.
+    """
+    bin_edges = fit_state_bins(train, q=q)
+    return apply_state_bins(train, bin_edges), apply_state_bins(test, bin_edges), bin_edges
 
 
 def discretize_state_features(data: pd.DataFrame) -> pd.DataFrame:
@@ -183,16 +291,8 @@ def discretize_state_features(data: pd.DataFrame) -> pd.DataFrame:
     Convert continuous market features into bins for tabular Q-learning.
 
     Q-learning stores values in a table, so each continuous feature is converted
-    into a small integer bucket. The regime label is already discrete.
+    into a small integer bucket. This helper fits bins on the supplied data and
+    is kept for quick demos. For train/test experiments, use
+    `discretize_train_test` to avoid leakage.
     """
-    states = data.copy()
-    states["return_bin"] = pd.qcut(states["return"], q=5, labels=False, duplicates="drop")
-    states["vol_bin"] = pd.qcut(states["volatility_20d"], q=5, labels=False, duplicates="drop")
-    states["momentum_bin"] = pd.qcut(states["momentum_20d"], q=5, labels=False, duplicates="drop")
-    states["rsi_bin"] = pd.qcut(states["rsi_14"], q=5, labels=False, duplicates="drop")
-    states["macd_bin"] = pd.qcut(states["macd_hist"], q=5, labels=False, duplicates="drop")
-    states["pca_1_bin"] = pd.qcut(states["pca_1"], q=5, labels=False, duplicates="drop")
-    state_cols = ["regime", "return_bin", "vol_bin", "momentum_bin", "rsi_bin", "macd_bin", "pca_1_bin"]
-    states[state_cols] = states[state_cols].astype(int)
-    return states
-
+    return apply_state_bins(data, fit_state_bins(data))

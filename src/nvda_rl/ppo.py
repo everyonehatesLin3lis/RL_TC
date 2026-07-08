@@ -12,7 +12,6 @@ from nvda_rl.evaluation import performance_metrics, strategy_frame
 
 
 PPO_OBSERVATION_COLUMNS = [
-    "return",
     "volatility_20d",
     "momentum_5d",
     "momentum_20d",

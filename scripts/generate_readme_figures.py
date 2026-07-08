@@ -10,7 +10,7 @@ import seaborn as sns
 from nvda_rl.agents import QLearningAgent
 from nvda_rl.env import TradingEnvironment
 from nvda_rl.evaluation import buy_and_hold_frame, random_policy_actions, strategy_frame
-from nvda_rl.features import describe_regimes, discretize_state_features
+from nvda_rl.features import describe_regimes, discretize_train_test
 
 
 FIGURE_DIR = Path("reports/figures")
@@ -94,10 +94,10 @@ def save_q_learning_equity(regimes: pd.DataFrame) -> None:
     PPO timing is left inside the notebook because it is intentionally slower.
     This README chart gives a fast overview of the simpler RL baseline.
     """
-    states = discretize_state_features(regimes)
-    train = states[states["date"] < "2021-01-01"].reset_index(drop=True)
-    test = states[states["date"] >= "2021-01-01"].reset_index(drop=True)
-    state_columns = ["regime", "return_bin", "vol_bin", "momentum_bin", "rsi_bin", "macd_bin", "pca_1_bin"]
+    train_raw = regimes[regimes["date"] < "2021-01-01"].reset_index(drop=True)
+    test_raw = regimes[regimes["date"] >= "2021-01-01"].reset_index(drop=True)
+    train, test, _ = discretize_train_test(train_raw, test_raw)
+    state_columns = ["regime", "momentum_bin", "vol_bin"]
     transaction_cost = 0.001
 
     agent = QLearningAgent(alpha=0.08, gamma=0.95, epsilon=0.30, epsilon_decay=0.992, min_epsilon=0.03)
@@ -142,4 +142,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

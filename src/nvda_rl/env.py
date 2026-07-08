@@ -22,7 +22,8 @@ class TradingEnvironment:
         Store market data and configuration for tabular RL.
 
         The environment starts flat and moves forward one trading day at a time.
-        The state is a tuple of already-discretized feature values.
+        The state is a tuple of already-discretized feature values plus the
+        previous action, so transaction-cost effects are observable.
         """
         self.data = data.reset_index(drop=True).copy()
         self.state_columns = state_columns
@@ -52,14 +53,17 @@ class TradingEnvironment:
         tuple[int, ...]
             Current state represented as integer bins.
         """
-        return tuple(int(self.data.loc[self.index, col]) for col in self.state_columns)
+        feature_state = tuple(int(self.data.loc[self.index, col]) for col in self.state_columns)
+        return (*feature_state, int(self.previous_action))
 
     def step(self, action: int) -> tuple[tuple[int, ...] | None, float, bool]:
         """
         Apply one action and move to the next trading day.
 
-        Reward is calculated as previous exposure times today's return, minus
-        transaction cost for changing from the previous action to the new action.
+        Timeline: observe end-of-day features, choose the next position, then
+        earn the next daily return from the previous position. Reward is
+        previous exposure times today's return, minus transaction cost for
+        changing from the previous action to the new action.
         """
         if action not in ACTIONS:
             raise ValueError(f"Action must be one of {ACTIONS.tolist()}.")
@@ -146,4 +150,3 @@ class GymTradingEnvironment(gym.Env):
         observation = np.zeros(self.observation_space.shape, dtype=np.float32) if terminated else self._observation()
         info = {"position": mapped_action, "date": self.data.loc[self.index - 1, "date"]}
         return observation, float(reward), terminated, False, info
-

@@ -54,11 +54,24 @@ def max_drawdown(equity: pd.Series) -> float:
 def performance_metrics(returns: pd.Series, equity: pd.Series, actions: pd.Series) -> dict[str, float]:
     """Compute project review metrics for a daily strategy."""
     returns = returns.fillna(0)
+    periods = max(len(returns), 1)
+    years = periods / 252
+    final_equity = float(equity.iloc[-1])
+    cagr = final_equity ** (1 / years) - 1 if years > 0 and final_equity > 0 else np.nan
+    annualized_volatility = float(returns.std() * np.sqrt(252))
+    downside = returns[returns < 0]
+    annualized_downside_volatility = float(downside.std() * np.sqrt(252)) if len(downside) > 1 else np.nan
     return {
-        "cumulative_return": float(equity.iloc[-1] - 1),
+        "cumulative_return": final_equity - 1,
         "average_daily_return": float(returns.mean()),
-        "annualized_return": float((1 + returns.mean()) ** 252 - 1),
-        "annualized_volatility": float(returns.std() * np.sqrt(252)),
+        "annualized_return": cagr,
+        "annualized_volatility": annualized_volatility,
+        "sharpe_ratio": float((returns.mean() * 252) / annualized_volatility)
+        if annualized_volatility > 0
+        else np.nan,
+        "sortino_ratio": float((returns.mean() * 252) / annualized_downside_volatility)
+        if annualized_downside_volatility > 0
+        else np.nan,
         "max_drawdown": max_drawdown(equity),
         "hit_ratio": float((returns > 0).mean()),
         "turnover": float(actions.diff().abs().fillna(actions.abs()).mean()),

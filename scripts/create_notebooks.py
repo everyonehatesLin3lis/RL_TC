@@ -230,7 +230,7 @@ unsup_cells = [
         import seaborn as sns
         from sklearn.metrics import silhouette_score
 
-        from nvda_rl.features import FEATURE_COLUMNS, describe_regimes, fit_unsupervised_features
+        from nvda_rl.features import CLUSTER_FEATURE_COLUMNS, describe_regimes, fit_unsupervised_train_test
 
         sns.set_theme(style="whitegrid", context="notebook")
         data = pd.read_csv(PROJECT_ROOT / "data" / "processed" / "nvda_features.csv", parse_dates=["date"])
@@ -255,9 +255,15 @@ unsup_cells = [
     ),
     code(
         """
-        enriched, regime_model, pca_model = fit_unsupervised_features(data, n_clusters=3)
-        scaled_features = regime_model.named_steps["scaler"].transform(enriched[FEATURE_COLUMNS])
-        score = silhouette_score(scaled_features, enriched["regime"])
+        split_date = "2021-01-01"
+        train_enriched, test_enriched, regime_model, pca_model = fit_unsupervised_train_test(
+            data,
+            split_date=split_date,
+            n_clusters=3,
+        )
+        enriched = pd.concat([train_enriched, test_enriched], ignore_index=True).sort_values("date").reset_index(drop=True)
+        scaled_features = regime_model.named_steps["scaler"].transform(train_enriched[CLUSTER_FEATURE_COLUMNS])
+        score = silhouette_score(scaled_features, train_enriched["regime"])
         print(f"Silhouette score: {score:.3f}")
 
         regime_summary = describe_regimes(enriched)
@@ -266,8 +272,9 @@ unsup_cells = [
     ),
     md(
         """
-        Regime 2 is the stress regime: average return is around -0.94% per day, with weak momentum and deep drawdowns.
-        Regime 0 is the normal positive regime, and Regime 1 is the strong momentum regime.
+        The models are fitted only on the training period before 2021. Test rows are transformed with the saved scaler, K-means centers, and PCA components.
+
+        Regimes are interpreted with next-day return, not the same return used to create features. This avoids mechanically labeling clusters by today's return.
         """
     ),
     code(
@@ -363,7 +370,7 @@ unsup_cells = [
         """
         Output:
 
-        `nvda_regimes.csv` is the bridge from unsupervised learning to the RL notebooks.
+        `nvda_regimes.csv` is the bridge from unsupervised learning to the RL notebooks. The file keeps the chronological train/test boundary honest: unsupervised models learn from train and only transform test.
         """
     ),
 ]
@@ -393,7 +400,7 @@ rl_cells = [
             random_policy_actions,
             strategy_frame,
         )
-        from nvda_rl.features import discretize_state_features
+        from nvda_rl.features import discretize_train_test
         from nvda_rl.ppo import (
             PPO_OBSERVATION_COLUMNS,
             LinearPPOAgent,
@@ -429,18 +436,19 @@ rl_cells = [
     ),
     code(
         """
-        states = discretize_state_features(enriched)
         split_date = "2021-01-01"
-        train = states[states["date"] < split_date].reset_index(drop=True)
-        test = states[states["date"] >= split_date].reset_index(drop=True)
+        train_raw = enriched[enriched["date"] < split_date].reset_index(drop=True)
+        test_raw = enriched[enriched["date"] >= split_date].reset_index(drop=True)
+        train, test, bin_edges = discretize_train_test(train_raw, test_raw)
 
-        state_columns = ["regime", "return_bin", "vol_bin", "momentum_bin", "rsi_bin", "macd_bin", "pca_1_bin"]
-        baseline_state_columns = ["return_bin", "vol_bin", "momentum_bin", "rsi_bin", "macd_bin"]
+        baseline_state_columns = ["momentum_bin", "vol_bin"]
+        regime_state_columns = ["regime", "momentum_bin", "vol_bin"]
+        regime_pca_state_columns = ["regime", "momentum_bin", "vol_bin", "pca_1_bin"]
         transaction_cost = 0.001
 
         print(f"Train rows: {len(train):,}")
         print(f"Test rows: {len(test):,}")
-        train[state_columns].head()
+        train[regime_pca_state_columns].head()
         """
     ),
     md(
@@ -457,15 +465,20 @@ rl_cells = [
     ),
     code(
         """
-        train_env = TradingEnvironment(train, state_columns=state_columns, transaction_cost=transaction_cost)
+        train_env = TradingEnvironment(train, state_columns=regime_pca_state_columns, transaction_cost=transaction_cost)
         q_agent = QLearningAgent(alpha=0.08, gamma=0.95, epsilon=0.30, epsilon_decay=0.992, min_epsilon=0.03)
         q_rewards = q_agent.train(train_env, episodes=500)
+
+        regime_env = TradingEnvironment(train, state_columns=regime_state_columns, transaction_cost=transaction_cost)
+        regime_agent = QLearningAgent(alpha=0.08, gamma=0.95, epsilon=0.30, epsilon_decay=0.992, min_epsilon=0.03)
+        regime_rewards = regime_agent.train(regime_env, episodes=500)
 
         no_unsup_env = TradingEnvironment(train, state_columns=baseline_state_columns, transaction_cost=transaction_cost)
         no_unsup_agent = QLearningAgent(alpha=0.08, gamma=0.95, epsilon=0.30, epsilon_decay=0.992, min_epsilon=0.03)
         no_unsup_rewards = no_unsup_agent.train(no_unsup_env, episodes=500)
 
         q_agent.save(MODEL_DIR / "q_learning.pkl")
+        regime_agent.save(MODEL_DIR / "q_regime_only.pkl")
         no_unsup_agent.save(MODEL_DIR / "q_no_unsup.pkl")
 
         pd.Series(q_rewards).rolling(20).mean().plot(figsize=(10, 4), color="tab:blue")
@@ -491,19 +504,23 @@ rl_cells = [
     code(
         """
         loaded_q_agent = QLearningAgent.load(MODEL_DIR / "q_learning.pkl")
+        loaded_regime_agent = QLearningAgent.load(MODEL_DIR / "q_regime_only.pkl")
         loaded_no_unsup_agent = QLearningAgent.load(MODEL_DIR / "q_no_unsup.pkl")
 
-        q_actions = loaded_q_agent.predict(TradingEnvironment(test, state_columns, transaction_cost))
+        q_actions = loaded_q_agent.predict(TradingEnvironment(test, regime_pca_state_columns, transaction_cost))
+        regime_actions = loaded_regime_agent.predict(TradingEnvironment(test, regime_state_columns, transaction_cost))
         no_unsup_actions = loaded_no_unsup_agent.predict(TradingEnvironment(test, baseline_state_columns, transaction_cost))
         random_actions = random_policy_actions(len(test), random_state=7)
 
         q_results = strategy_frame(test, q_actions, transaction_cost, "q_learning")
+        regime_results = strategy_frame(test, regime_actions, transaction_cost, "q_regime")
         no_unsup_results = strategy_frame(test, no_unsup_actions, transaction_cost, "q_no_unsup")
         random_results = strategy_frame(test, random_actions, transaction_cost, "random")
         hold_results = buy_and_hold_frame(test)
 
         comparison = (
             q_results[["date", "q_learning_return", "q_learning_equity", "action"]]
+            .merge(regime_results[["date", "q_regime_return", "q_regime_equity"]], on="date")
             .merge(no_unsup_results[["date", "q_no_unsup_return", "q_no_unsup_equity"]], on="date")
             .merge(random_results[["date", "random_return", "random_equity"]], on="date")
             .merge(hold_results[["date", "buy_hold_return", "buy_hold_equity"]], on="date")
@@ -519,7 +536,7 @@ rl_cells = [
     ),
     md(
         """
-        Here PPO receives scaled returns, volatility, RSI, MACD, ATR, regime, and PCA features directly.
+        Here PPO receives scaled volatility, momentum, RSI, MACD, ATR, regime, and PCA features directly. Current-day return is not included as an observation feature.
         """
     ),
     code(
@@ -571,6 +588,7 @@ rl_cells = [
         """
         metric_rows = {
             "q_learning": performance_metrics(comparison["q_learning_return"], comparison["q_learning_equity"], q_results["action"]),
+            "q_regime_only": performance_metrics(comparison["q_regime_return"], comparison["q_regime_equity"], regime_results["action"]),
             "q_no_unsup": performance_metrics(comparison["q_no_unsup_return"], comparison["q_no_unsup_equity"], no_unsup_results["action"]),
             "buy_hold": performance_metrics(comparison["buy_hold_return"], comparison["buy_hold_equity"], pd.Series(np.ones(len(comparison)))),
             "random": performance_metrics(comparison["random_return"], comparison["random_equity"], pd.Series(random_actions)),
@@ -585,7 +603,7 @@ rl_cells = [
             )
 
         metrics = pd.DataFrame(metric_rows).T
-        metrics[["cumulative_return", "annualized_return", "max_drawdown", "hit_ratio", "turnover"]]
+        metrics[["cumulative_return", "annualized_return", "sharpe_ratio", "max_drawdown", "hit_ratio", "turnover"]]
         """
     ),
     md(
@@ -597,6 +615,7 @@ rl_cells = [
         """
         plt.figure(figsize=(12, 5))
         plt.plot(comparison["date"], comparison["q_learning_equity"], label="Q-learning")
+        plt.plot(comparison["date"], comparison["q_regime_equity"], label="Q-learning regime only", alpha=0.8)
         plt.plot(comparison["date"], comparison["q_no_unsup_equity"], label="Q-learning no regimes/PCA", alpha=0.8)
         plt.plot(comparison["date"], comparison["buy_hold_equity"], label="Buy and hold")
         plt.plot(comparison["date"], comparison["random_equity"], label="Random", alpha=0.7)
